@@ -31,6 +31,21 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # 持久化 pinned/GPU buffer:消除 decode 每步的 pinned 分配(cudaHostAlloc)与中间张量
+        self.dec_max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        with torch.device("cpu"):
+            pin = dict(
+                input_ids=torch.empty(self.dec_max_bs, dtype=torch.int64, pin_memory=True),
+                positions=torch.empty(self.dec_max_bs, dtype=torch.int64, pin_memory=True),
+                slot_mapping=torch.empty(self.dec_max_bs, dtype=torch.int32, pin_memory=True),
+                context_lens=torch.empty(self.dec_max_bs, dtype=torch.int32, pin_memory=True),
+                block_tables=torch.empty(self.dec_max_bs, max_num_blocks, dtype=torch.int32, pin_memory=True),
+                temperatures=torch.empty(self.dec_max_bs, dtype=torch.float32, pin_memory=True),
+                tokens=torch.empty(self.dec_max_bs, dtype=torch.int64, pin_memory=True),
+            )
+        gpu = {k: torch.empty(v.shape, dtype=v.dtype, device="cuda") for k, v in pin.items() if k != "tokens"}
+        self.dec_pin, self.dec_gpu = pin, gpu
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -170,6 +185,36 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        bs = len(seqs)
+        if bs > self.dec_max_bs:    # 超大 batch 退回逐次分配路径
+            return self._prepare_decode_slow(seqs)
+        pin, gpu = self.dec_pin, self.dec_gpu
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        block_tables = []
+        for seq in seqs:
+            input_ids.append(seq.last_token)
+            positions.append(len(seq) - 1)
+            context_lens.append(len(seq))
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            block_tables.append(seq.block_table)
+        max_len = max(len(b) for b in block_tables)
+        pin["input_ids"][:bs] = torch.tensor(input_ids, dtype=torch.int64)
+        pin["positions"][:bs] = torch.tensor(positions, dtype=torch.int64)
+        pin["slot_mapping"][:bs] = torch.tensor(slot_mapping, dtype=torch.int32)
+        pin["context_lens"][:bs] = torch.tensor(context_lens, dtype=torch.int32)
+        pin["block_tables"][:bs, :max_len] = torch.tensor(
+            [b + [-1] * (max_len - len(b)) for b in block_tables], dtype=torch.int32)
+        for k in ("input_ids", "positions", "slot_mapping", "context_lens"):
+            gpu[k][:bs].copy_(pin[k][:bs], non_blocking=True)
+        gpu["block_tables"][:bs, :max_len].copy_(pin["block_tables"][:bs, :max_len], non_blocking=True)
+        set_context(False, slot_mapping=gpu["slot_mapping"][:bs],
+                   context_lens=gpu["context_lens"][:bs], block_tables=gpu["block_tables"][:bs, :max_len])
+        return gpu["input_ids"][:bs], gpu["positions"][:bs]
+
+    def _prepare_decode_slow(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         slot_mapping = []
@@ -189,6 +234,11 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
+        if len(seqs) <= self.dec_max_bs:
+            bs = len(seqs)
+            self.dec_pin["temperatures"][:bs] = torch.tensor(temperatures, dtype=torch.float32)
+            self.dec_gpu["temperatures"][:bs].copy_(self.dec_pin["temperatures"][:bs], non_blocking=True)
+            return self.dec_gpu["temperatures"][:bs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
@@ -215,7 +265,18 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if self.rank == 0:
+            tokens_gpu = self.sampler(logits, temperatures)
+            bs = logits.size(0)
+            if bs <= self.dec_max_bs and not is_prefill:
+                # 异步 D2H 到常驻 pinned buffer,消除每步 pageable 分配
+                self.dec_pin["tokens"][:bs].copy_(tokens_gpu, non_blocking=True)
+                torch.cuda.current_stream().synchronize()
+                token_ids = self.dec_pin["tokens"][:bs].tolist()
+            else:
+                token_ids = tokens_gpu.tolist()
+        else:
+            token_ids = None
         reset_context()
         return token_ids
 
