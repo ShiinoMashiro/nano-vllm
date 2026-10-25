@@ -11,11 +11,13 @@ def main():
     seed(0)
     num_seqs = int(sys.argv[1]) if len(sys.argv) > 1 else 32
     enforce_eager = len(sys.argv) > 2 and sys.argv[2] == "eager"
+    gpu_util = float(sys.argv[3]) if len(sys.argv) > 3 else 0.9
     max_input_len = 512
     max_ouput_len = 512
 
-    path = os.path.expanduser("~/huggingface/Qwen3-1.7B/") 
-    llm = LLM(path, enforce_eager=False, max_model_len=2048)
+    path = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
+    llm = LLM(path, enforce_eager=enforce_eager, max_model_len=2048,
+              gpu_memory_utilization=gpu_util)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]

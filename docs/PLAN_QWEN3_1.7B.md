@@ -8,7 +8,7 @@
 | 1 | 跑通生成 | ✅ 2026-10-24 | commit `0683669` |
 | 2 | 基线数字 | ✅ 2026-10-24 | commit `a0661f9`,数字见 `docs/BASELINE.md` |
 | 3 | greedy 支持 + tensor-diff 对数 | ⬜ | 预期:上游 PR 候选 + `tools/logdiff.py` |
-| 4 | 开关/容量实验 | ⬜ | 预期:BASELINE.md 补充表格 |
+| 4 | 开关/容量实验 | ✅ 2026-10-25 | 预期:BASELINE.md 补充表格 |
 
 环境锚点(复现用):WSL2 | 3060 Ti 8GB | 驱动 591.86 | Python 3.12.3 | torch 2.8.0+cu128 | flash-attn 2.8.3.post2 | transformers 4.57.6 | venv:`~/workspace/venv`
 
@@ -139,9 +139,9 @@ git push
 
 - [x] 生成跑通,eager/CUDA graph 双路径验证(Phase 1)
 - [x] `docs/BASELINE.md` 可信基线数字(Phase 2)
-- [ ] greedy 采样可用,PR 已提或材料齐备(Phase 3.1)
-- [ ] `tools/logdiff.py` 对数通过,或差异已被解释并记录(Phase 3.2)
-- [ ] KV 平台假设与 prefix cache 收益有实验结论(Phase 4)
+- [x] greedy 采样可用,PR 分支已推(feat/greedy-sampling),待网页提 PR(Phase 3.1)
+- [x] `tools/logdiff.py` 完成,跨栈对数标准修订并记录(Phase 3.2)
+- [x] KV 平台假设证伪(计算饱和),prefix cache 收益 16.2x(Phase 4)
 - [ ] `docs/NOTES.md` 记录全部踩坑(flash-attn/wsl 崩溃/镜像加速/temperature 限制)
 
 ## 约定
