@@ -124,15 +124,23 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        itemsize = 1 if config.kv_cache_dtype == "int8" else hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        if config.kv_cache_dtype == "int8":
+            self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, dtype=torch.int8)
+            self.kv_scale = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks * self.block_size, num_kv_heads, dtype=hf_config.dtype)
+        else:
+            self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if config.kv_cache_dtype == "int8":
+                    module.k_scale = self.kv_scale[0, layer_id]
+                    module.v_scale = self.kv_scale[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -140,6 +148,23 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
+
+
+    def build_kv_gather(self, lens: torch.Tensor, block_tables: torch.Tensor):
+        # 把 (B, maxb) block_table 展开成 seq-major 的行索引,并给出 varlen 的 cu_seqlens_k。
+        # 上界行数 R = B*maxb*block_size(含 padding,attention 只读 [0, cu[-1]) 区间)。
+        B, maxb = block_tables.shape
+        bsz = self.block_size
+        cu = torch.zeros(B + 1, dtype=torch.int32, device=lens.device)
+        torch.cumsum(lens, 0, dtype=torch.int32, out=cu[1:])
+        ar = torch.arange(B * maxb * bsz, device=lens.device, dtype=torch.int32)
+        seq_id = torch.searchsorted(cu[1:], ar, right=True).clamp(max=B - 1)
+        token_pos = ar - cu[seq_id]
+        valid = token_pos < lens[seq_id]
+        block_pos = (token_pos // bsz).clamp(max=maxb - 1)
+        idx = block_tables[seq_id, block_pos] * bsz + token_pos % bsz
+        idx = torch.where(valid, idx, 0)
+        return idx, cu
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -176,12 +201,18 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        kv_kwargs = {}
+        if self.config.kv_cache_dtype == "int8" and block_tables is not None:
+            lens = torch.tensor(cu_seqlens_k[1:], dtype=torch.int32, device="cuda") - \
+                   torch.tensor(cu_seqlens_k[:-1], dtype=torch.int32, device="cuda")
+            idx, cu = self.build_kv_gather(lens, block_tables)
+            kv_kwargs = dict(kv_rows_idx=idx, kv_cu_k=cu, kv_max_len=self.config.max_model_len)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, **kv_kwargs)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -210,8 +241,15 @@ class ModelRunner:
         for k in ("input_ids", "positions", "slot_mapping", "context_lens"):
             gpu[k][:bs].copy_(pin[k][:bs], non_blocking=True)
         gpu["block_tables"][:bs, :max_len].copy_(pin["block_tables"][:bs, :max_len], non_blocking=True)
-        set_context(False, slot_mapping=gpu["slot_mapping"][:bs],
-                   context_lens=gpu["context_lens"][:bs], block_tables=gpu["block_tables"][:bs, :max_len])
+        bt = gpu["block_tables"][:bs, :max_len]
+        if self.config.kv_cache_dtype == "int8":
+            idx, cu = self.build_kv_gather(gpu["context_lens"][:bs], bt)
+            set_context(False, slot_mapping=gpu["slot_mapping"][:bs],
+                       context_lens=gpu["context_lens"][:bs], block_tables=bt,
+                       kv_rows_idx=idx, kv_cu_k=cu, kv_max_len=self.config.max_model_len)
+        else:
+            set_context(False, slot_mapping=gpu["slot_mapping"][:bs],
+                       context_lens=gpu["context_lens"][:bs], block_tables=bt)
         return gpu["input_ids"][:bs], gpu["positions"][:bs]
 
     def _prepare_decode_slow(self, seqs: list[Sequence]):
@@ -229,7 +267,12 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        if self.config.kv_cache_dtype == "int8":
+            idx, cu = self.build_kv_gather(context_lens, block_tables)
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                       kv_rows_idx=idx, kv_cu_k=cu, kv_max_len=self.config.max_model_len)
+        else:
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

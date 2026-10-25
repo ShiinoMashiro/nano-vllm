@@ -6,7 +6,9 @@ BATCHES = [1, 2, 4, 8, 32]
 REPEAT = 3
 TOKENS = 256
 
-llm = LLM(os.path.expanduser("~/huggingface/Qwen3-1.7B"), enforce_eager=False, max_model_len=2048)
+eager = os.environ.get("EAGER") == "1"
+kv = os.environ.get("KV_DTYPE", "bf16")
+llm = LLM(os.path.expanduser("~/huggingface/Qwen3-1.7B"), enforce_eager=eager, max_model_len=2048, kv_cache_dtype=kv)
 llm.generate(["warmup"], SamplingParams(temperature=0, max_tokens=8), use_tqdm=False)
 
 print(f"| bs | TPOT ms (median of {REPEAT}) | 聚合 tok/s |")

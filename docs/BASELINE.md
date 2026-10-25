@@ -69,3 +69,31 @@ bench 参数:len 100~512 in / 100~512 out,ignore_eos,max_model_len=2048,seed(0)
 
 命令:`python tools/prefix_bench.py a / b`。实算减少 87%,墙钟加速 16.2x,
 实测 0.30s 与"前缀全命中"理论值(~0.37s)吻合;跨请求命中有效(多轮对话/共享系统提示词场景)。
+
+## int8 KVCache 拆小版实验(2026-10-25,feat/int8-kvcache 分支)
+
+实现:存储 int8(逐 token 逐 head 动态 absmax/127 量化,Triton 写入 kernel)+ 读时 gather 反量化;
+读路径统一走 flash_attn_varlen(gather 索引全层共享、纯 GPU 构建无同步);int8 模式限定 eager
+(gather 形状依赖数据,与 CUDA graph 静态形状冲突——已在 config 断言)。
+
+### 容量:×2 ✅
+num_kvcache_blocks:bf16 **71** → int8 **142**(同显存同参数,`tools/kv_int8_check.py` 打印)。
+
+### 精度:量化扰动不改语义
+同栈 greedy 10 条全部在位置 2 分叉(近并列 logits 被量化误差翻转 → 轨迹合理分岔)。
+语义抽检:两侧输出均连贯,int8 版甚至跳过 think 直达答案(轨迹差异 ≠ 质量退化)。
+待做:wikitext PPL 严格评测。
+
+### 性能:materialize 反量化方案 TPOT 回退(诚实记录)
+
+| bs | bf16 eager TPOT ms | int8 eager TPOT ms | 变化 |
+| --- | --- | --- | --- |
+| 1 | 32.88 | 38.88 | +18% |
+| 2 | 29.96 | 43.60 | +46% |
+| 4 | 29.88 | 52.34 | +75% |
+| 8 | 28.01 | 42.88 | +53% |
+| 32 | 29.58 | 44.66 | +51% |
+
+原因:省一半 KV 读带宽 < gather+cast+mul 反量化开销(每层 ~10 kernel × 28 层)。
+结论:v1 定位 = **容量 ×2 + 精度验证工具**;吞吐收益必须做融合 int8 attention kernel
+(dequant 在 kernel 内,即课程项目 4 的完整版),已列入后续 kernel 项。
